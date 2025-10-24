@@ -1,0 +1,172 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          # Get list of changed files
+          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > changed_files.txt
+
+          # Filter for relevant file types
+          grep -E '\.(ts|tsx|js|jsx|py|java|cpp|c|h|go|rs|php|rb|swift|kt|scala|r|m|mm)$' changed_files.txt > code_files.txt || true
+
+          # Create file list
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          cat code_files.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate code review
+        id: review
+        run: |
+          # Create review script
+          cat > review_script.js << 'EOF'
+          const fs = require('fs');
+          const https = require('https');
+
+          async function getCodeReview() {
+            const changedFiles = process.env.CHANGED_FILES || '';
+            const files = changedFiles.split('\n').filter(f => f.trim());
+            
+            if (files.length === 0) {
+              console.log('No code files changed');
+              return;
+            }
+            
+            // Read file contents
+            let codeContent = '';
+            for (const file of files) {
+              if (fs.existsSync(file)) {
+                const content = fs.readFileSync(file, 'utf8');
+                codeContent += `\n\n=== ${file} ===\n${content}`;
+              }
+            }
+            
+            // Prepare prompt for ChatGPT
+            const prompt = `다음은 GitHub Pull Request의 변경된 코드입니다. 
+
+          코드 리뷰를 수행하고 다음 관점에서 분석해주세요:
+          1. 코드 품질 및 가독성
+          2. 잠재적 버그나 문제점
+          3. 보안 취약점
+          4. 성능 최적화 기회
+          5. 코드 스타일 및 컨벤션 준수
+          6. 테스트 커버리지
+          7. 개선 제안
+
+          한국어로 상세한 리뷰를 작성해주세요.
+
+          변경된 코드:
+          ${codeContent}`;
+
+            // Call OpenAI API
+            const data = JSON.stringify({
+              model: "gpt-4",
+              messages: [
+                {
+                  role: "system",
+                  content: "당신은 경험 많은 시니어 개발자입니다. 코드 리뷰를 전문적으로 수행하고 구체적이고 실용적인 피드백을 제공합니다."
+                },
+                {
+                  role: "user",
+                  content: prompt
+                }
+              ],
+              max_tokens: 4000,
+              temperature: 0.3
+            });
+            
+            const options = {
+              hostname: 'api.openai.com',
+              port: 443,
+              path: '/v1/chat/completions',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+              }
+            };
+            
+            const req = https.request(options, (res) => {
+              let responseData = '';
+              
+              res.on('data', (chunk) => {
+                responseData += chunk;
+              });
+              
+              res.on('end', () => {
+                try {
+                  const response = JSON.parse(responseData);
+                  if (response.choices && response.choices[0]) {
+                    const review = response.choices[0].message.content;
+                    console.log('REVIEW_RESULT<<EOF');
+                    console.log(review);
+                    console.log('EOF');
+                  } else {
+                    console.error('API 응답 오류:', response);
+                  }
+                } catch (error) {
+                  console.error('응답 파싱 오류:', error);
+                }
+              });
+            });
+            
+            req.on('error', (error) => {
+              console.error('API 요청 오류:', error);
+            });
+            
+            req.write(data);
+            req.end();
+          }
+
+          getCodeReview();
+          EOF
+
+          # Run the review script
+          node review_script.js
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Comment on PR
+        if: steps.review.outputs.review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Read review result from environment
+            const reviewContent = process.env.REVIEW_RESULT || '🤖 AI 코드 리뷰를 수행했지만 결과를 가져올 수 없습니다. API 키와 네트워크 연결을 확인해주세요.';
+
+            // Create comment
+            const comment = `## 🤖 AI 코드 리뷰
+
+            ${reviewContent}
+
+            ---
+            *이 리뷰는 GitHub Actions와 OpenAI GPT-4를 사용하여 자동으로 생성되었습니다.*`;
+
+            // Post comment to PR
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+        env:
+          REVIEW_RESULT: ${{ steps.review.outputs.review }}
