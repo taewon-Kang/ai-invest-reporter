@@ -134,7 +134,6 @@ jobs:
                 { role: "user", content: prompt }
               ],
               max_completion_tokens: MAX_COMPLETION_TOKENS,
-              reasoning: { effort: "low" },   // 내부 추론 토큰 억제 시도
               stop: ["<END>"]
             };
             const payload = JSON.stringify(payloadObj);
