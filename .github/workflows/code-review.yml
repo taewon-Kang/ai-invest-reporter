@@ -134,7 +134,6 @@ jobs:
                 { role: "user", content: prompt }
               ],
               max_completion_tokens: MAX_COMPLETION_TOKENS,
-              stop: ["<END>"]
             };
             const payload = JSON.stringify(payloadObj);
             console.log("=== OpenAI payload ===\n", payload); // 전송 파라미터 로깅
