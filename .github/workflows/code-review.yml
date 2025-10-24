@@ -3,6 +3,7 @@ name: AI Code Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -14,83 +15,53 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Get changed files
-        id: changed-files
+      - name: Make diff
+        id: diff
         run: |
-          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > changed_files.txt
-          grep -E '\.(ts|tsx|js|jsx|py|java|cpp|c|h|go|rs|php|rb|swift|kt|scala|r|m|mm)$' changed_files.txt > code_files.txt || true
-          echo "files<<EOF" >> $GITHUB_OUTPUT
-          cat code_files.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          git diff -U0 ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > patch.diff || true
+          if [ ! -s patch.diff ]; then echo "no diff" > patch.diff; fi
 
-      - name: Generate code review
+      - name: Generate review
         id: review
         env:
-          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MAX_FILE_CHARS: "8000"
-          MAX_TOTAL_CHARS: "60000"
         run: |
           cat > review_script.js << 'EOF'
           const fs = require('fs');
-          const { execSync } = require('child_process');
           const https = require('https');
 
-          const MAX_FILE_CHARS = parseInt(process.env.MAX_FILE_CHARS || '8000', 10);
-          const MAX_TOTAL_CHARS = parseInt(process.env.MAX_TOTAL_CHARS || '60000', 10);
-
-          function safeRead(path) {
+          function readPatch(path) {
             try {
-              const stat = fs.statSync(path);
-              if (!stat.isFile() || stat.size > 5 * 1024 * 1024) return '';
-              const buf = fs.readFileSync(path, 'utf8');
-              return buf.replace(/\u0000/g, '');
+              const txt = fs.readFileSync(path, 'utf8');
+              const max = 120000;
+              if (txt.length <= max) return txt;
+              const head = Math.floor(max * 0.7);
+              const tail = max - head;
+              return txt.slice(0, head) + "\n... (truncated) ...\n" + txt.slice(-tail);
             } catch {
               return '';
             }
           }
 
-          function buildCodeBundle(files) {
-            let total = 0;
-            const parts = [];
-            for (const f of files) {
-              const content = safeRead(f);
-              if (!content) continue;
-              let slice = content;
-              if (slice.length > MAX_FILE_CHARS) {
-                const head = Math.floor(MAX_FILE_CHARS * 0.6);
-                const tail = MAX_FILE_CHARS - head;
-                slice = slice.slice(0, head) + "\n...\n/* truncated */\n...\n" + slice.slice(-tail);
-              }
-              const block = `\n\n=== ${f} ===\n` + slice;
-              if (total + block.length > MAX_TOTAL_CHARS) break;
-              parts.push(block);
-              total += block.length;
-            }
-            return parts.join('');
-          }
-
-          async function callOpenAI(prompt) {
+          function callOpenAI(prompt) {
             const data = JSON.stringify({
               model: "gpt-5",
               messages: [
-                { role: "system", content: "당신은 시니어 코드 리뷰어입니다. 근거가 있는 지적, 구체적 수정안, 필요한 테스트를 한국어로 간결하게 제시합니다." },
+                { role: "system", content: "당신은 시니어 코드 리뷰어입니다. 변경된 라인 중심으로 정확한 근거와 구체적 수정안을 한국어로 제시하세요. 필요 시 코드 제안을 포함하세요." },
                 { role: "user", content: prompt }
               ],
-              temperature: 0.2,
               max_completion_tokens: 1500
             });
-
             const options = {
               hostname: 'api.openai.com',
               port: 443,
@@ -101,76 +72,66 @@ jobs:
                 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
               }
             };
-
-            return await new Promise((resolve, reject) => {
+            return new Promise((resolve) => {
               const req = https.request(options, (res) => {
-                let responseData = '';
-                res.on('data', (chunk) => { responseData += chunk; });
+                let buf = '';
+                res.on('data', (c) => buf += c);
                 res.on('end', () => {
                   try {
-                    const j = JSON.parse(responseData);
-                    if (j.error) return reject(new Error(JSON.stringify(j.error)));
-                    const review = j.choices?.[0]?.message?.content?.trim() || '';
-                    resolve(review);
+                    const j = JSON.parse(buf);
+                    if (j.error) return resolve(`API 요청 실패: ${JSON.stringify(j.error)}`);
+                    const out = j.choices?.[0]?.message?.content?.trim() || '리뷰 결과가 비어 있습니다.';
+                    resolve(out);
                   } catch (e) {
-                    reject(e);
+                    resolve(`응답 파싱 오류: ${e.message}`);
                   }
                 });
               });
-              req.on('error', reject);
+              req.on('error', (e) => resolve(`API 요청 오류: ${e.message}`));
               req.write(data);
               req.end();
             });
           }
 
           (async () => {
-            const changedFiles = (process.env.CHANGED_FILES || '').split('\n').map(s => s.trim()).filter(Boolean);
-            if (changedFiles.length === 0) {
-              const out = "변경된 코드 파일이 없습니다.";
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `review<<EOF\n${out}\nEOF\n`);
-              process.exit(0);
-            }
-
-            const bundle = buildCodeBundle(changedFiles);
+            const diff = readPatch('patch.diff');
             const prompt = [
-              "다음은 Pull Request에서 변경된 코드의 발췌입니다.",
+              "아래는 이 PR의 unified diff(-U0)입니다.",
               "",
-              "아래 항목을 반드시 포함하여 리뷰를 작성하세요:",
+              "리뷰 출력 형식:",
               "1) 주요 이슈",
               "2) 잠재적 버그/경계값",
               "3) 보안/성능",
               "4) 스타일/일관성",
               "5) 테스트 보강 포인트",
-              "가능하면 코드 제안도 함께 제시하세요.",
+              "가능하면 코드 제안을 함께 제시하세요.",
               "",
-              "변경 코드:",
-              bundle
+              "diff:",
+              diff
             ].join("\n");
-
-            try {
-              const review = await callOpenAI(prompt);
-              const result = review || "리뷰 결과가 비어 있습니다.";
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `review<<EOF\n${result}\nEOF\n`);
-            } catch (e) {
-              const msg = `API 요청 실패: ${e.message || e}`;
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `review<<EOF\n${msg}\nEOF\n`);
-              process.exit(0);
-            }
+            const review = await callOpenAI(prompt);
+            fs.writeFileSync('review.txt', review, 'utf8');
+            console.log('REVIEW_RESULT<<EOF');
+            console.log(review);
+            console.log('EOF');
           })();
           EOF
 
-          node review_script.js
+          node review_script.js | tee review_out.txt
+          awk '/REVIEW_RESULT<<EOF/{flag=1;next}/EOF/{flag=0}flag' review_out.txt > review.txt
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          cat review.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Comment on PR
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            const reviewContent = `${{ steps.review.outputs.review }}` || '결과를 가져오지 못했습니다.';
             const body = [
               "## 🤖 AI 코드 리뷰",
               "",
-              reviewContent,
+              `${{ steps.review.outputs.review }}` || "리뷰 결과를 가져오지 못했습니다.",
               "",
               "---",
               "_이 리뷰는 GitHub Actions와 GPT-5로 자동 생성되었습니다._"
