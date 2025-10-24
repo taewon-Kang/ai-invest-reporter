@@ -36,7 +36,7 @@ jobs:
           echo "== DIFF SIZE ==" && wc -c patch.diff || true
           echo "== DIFF HEAD ==" && head -n 60 patch.diff || true
 
-      - name: Generate review (debug)
+      - name: Generate review (debug with chunking)
         id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -45,7 +45,7 @@ jobs:
 
           if [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "review<<EOF" >> "$GITHUB_OUTPUT"
-            echo "OPENAI_API_KEY가 비어 있습니다. 리포지토리 Settings > Secrets에서 확인하세요." >> "$GITHUB_OUTPUT"
+            echo "OPENAI_API_KEY가 비어 있습니다. 포크 PR이거나 시크릿 미설정입니다. Settings > Secrets를 확인하세요." >> "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -54,35 +54,63 @@ jobs:
           const fs = require('fs');
           const https = require('https');
 
-          function readPatch(path) {
-            try {
-              const txt = fs.readFileSync(path, 'utf8');
-              const max = 120000;
-              if (txt.length <= max) return txt;
-              const head = Math.floor(max * 0.7);
-              const tail = max - head;
-              return txt.slice(0, head) + "\n... (truncated) ...\n" + txt.slice(-tail);
-            } catch {
-              return '';
+          const CHUNK_CHAR_BUDGET = 10000;        // ~2.5k tokens 정도
+          const MAX_COMPLETION_TOKENS = 1200;     // 필요시 1500까지
+
+          function readWhole(path) {
+            try { return fs.readFileSync(path, 'utf8'); } catch { return ''; }
+          }
+
+          function splitByFile(diffText) {
+            const files = [];
+            const lines = diffText.split('\n');
+            let cur = [];
+            for (const line of lines) {
+              if (line.startsWith('diff --git ')) {
+                if (cur.length) files.push(cur.join('\n'));
+                cur = [line];
+              } else {
+                cur.push(line);
+              }
             }
+            if (cur.length) files.push(cur.join('\n'));
+            return files;
+          }
+
+          function chunkByChars(text, budget = CHUNK_CHAR_BUDGET) {
+            const chunks = [];
+            for (let i = 0; i < text.length; i += budget) {
+              chunks.push(text.slice(i, i + budget));
+            }
+            return chunks;
+          }
+
+          function buildPrompt(diffChunk) {
+            return [
+              "아래는 이 PR의 unified diff(-U0) 일부입니다.",
+              "",
+              "리뷰 출력 형식:",
+              "1) 주요 이슈",
+              "2) 잠재적 버그/경계값",
+              "3) 보안/성능",
+              "4) 스타일/일관성",
+              "5) 테스트 보강 포인트",
+              "가능하면 코드 제안을 함께 제시하세요.",
+              "",
+              "diff:",
+              diffChunk
+            ].join("\n");
           }
 
           function callOpenAI(prompt) {
             const payload = JSON.stringify({
               model: "gpt-5",
               messages: [
-                {
-                  role: "system",
-                  content: "당신은 시니어 코드 리뷰어입니다. 변경된 라인 중심으로 근거와 구체적 수정안을 한국어로 제시하세요. 필요 시 코드 제안을 포함하세요."
-                },
-                {
-                  role: "user",
-                  content: prompt
-                }
+                { role: "system", content: "당신은 시니어 코드 리뷰어입니다. 변경된 라인 중심으로 근거와 구체적 수정안을 한국어로 제시하세요. 필요 시 코드 제안을 포함하세요." },
+                { role: "user", content: prompt }
               ],
-              max_completion_tokens: 1500
+              max_completion_tokens: MAX_COMPLETION_TOKENS
             });
-
             const options = {
               hostname: "api.openai.com",
               port: 443,
@@ -93,7 +121,6 @@ jobs:
                 "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
               }
             };
-
             return new Promise((resolve) => {
               const req = https.request(options, (res) => {
                 let buf = "";
@@ -105,53 +132,65 @@ jobs:
 
                   try {
                     const j = JSON.parse(buf);
-                    if (j.error) {
-                      return resolve({ ok: false, msg: `API 요청 실패: ${JSON.stringify(j.error)}` });
-                    }
-                    const content = j.choices?.[0]?.message?.content;
+                    if (j.error) return resolve({ ok:false, msg:`API 요청 실패: ${JSON.stringify(j.error)}` });
+                    const choice = j.choices?.[0];
+                    const content = choice?.message?.content;
                     if (!content || !String(content).trim()) {
-                      return resolve({ ok: false, msg: `빈 choices. 원문 앞부분: ${buf.slice(0, 500)}...` });
+                      return resolve({ ok:false, msg:`빈 choices. finish_reason=${choice?.finish_reason || 'n/a'}` });
                     }
-                    return resolve({ ok: true, msg: String(content).trim() });
+                    resolve({ ok:true, msg:String(content).trim() });
                   } catch (e) {
-                    return resolve({ ok: false, msg: `응답 파싱 오류: ${e.message}. 원문 앞부분: ${buf.slice(0, 500)}...` });
+                    resolve({ ok:false, msg:`응답 파싱 오류: ${e.message}` });
                   }
                 });
               });
-              req.on("error", (e) => resolve({ ok: false, msg: `API 요청 오류: ${e.message}` }));
+              req.on("error", (e) => resolve({ ok:false, msg:`API 요청 오류: ${e.message}` }));
               req.write(payload);
               req.end();
             });
           }
 
+          async function reviewChunk(diffChunk) {
+            // 1차 시도
+            let r = await callOpenAI(buildPrompt(diffChunk));
+            if (r.ok) return r.msg;
+
+            // 길이로 추정되면 반으로 쪼개 재시도
+            if (diffChunk.length > CHUNK_CHAR_BUDGET / 2) {
+              const mid = Math.floor(diffChunk.length / 2);
+              const left = diffChunk.slice(0, mid);
+              const right = diffChunk.slice(mid);
+              const a = await reviewChunk(left);
+              const b = await reviewChunk(right);
+              return [a, b].filter(Boolean).join("\n\n");
+            }
+            return `부분 리뷰 실패: ${r.msg}`;
+          }
+
           (async () => {
-            const diff = readPatch("patch.diff");
-            if (!diff || !diff.trim() || diff.trim() === "no diff") {
+            const diff = readWhole("patch.diff");
+            if (!diff.trim() || diff.trim() === "no diff") {
               const msg = "patch.diff 가 비어 있습니다. 이 PR에 변경 라인이 없거나 diff 생성이 실패했습니다.";
               fs.writeFileSync("review.txt", msg, "utf8");
               console.log("REVIEW_RESULT<<EOF"); console.log(msg); console.log("EOF");
               process.exit(0);
             }
 
-            const prompt = [
-              "아래는 이 PR의 unified diff(-U0)입니다.",
-              "",
-              "리뷰 출력 형식:",
-              "1) 주요 이슈",
-              "2) 잠재적 버그/경계값",
-              "3) 보안/성능",
-              "4) 스타일/일관성",
-              "5) 테스트 보강 포인트",
-              "가능하면 코드 제안을 함께 제시하세요.",
-              "",
-              "diff:",
-              diff
-            ].join("\n");
+            const fileDiffs = splitByFile(diff);
+            const outputs = [];
+            for (const fd of fileDiffs) {
+              const fileChunks = chunkByChars(fd, CHUNK_CHAR_BUDGET);
+              for (const ch of fileChunks) {
+                const out = await reviewChunk(ch);
+                if (out) outputs.push(out);
+              }
+            }
 
-            const result = await callOpenAI(prompt);
-            const out = result.ok ? result.msg : result.msg;
-            fs.writeFileSync("review.txt", out, "utf8");
-            console.log("REVIEW_RESULT<<EOF"); console.log(out); console.log("EOF");
+            const merged = outputs.join("\n\n---\n\n").slice(0, 24000); // 최종 안전 캡
+            fs.writeFileSync("review.txt", merged || "리뷰 결과가 비어 있습니다.", "utf8");
+            console.log("REVIEW_RESULT<<EOF"); 
+            console.log(merged || "리뷰 결과가 비어 있습니다."); 
+            console.log("EOF");
           })();
           EOF
 
