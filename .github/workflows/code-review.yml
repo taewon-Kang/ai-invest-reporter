@@ -132,7 +132,10 @@ jobs:
 
                   try {
                     const j = JSON.parse(buf);
-                    console.log("j : ", j);
+                    console.log("=== OPENAI message ===");
+                    console.log(JSON.stringify(j.choices?.[0]?.message, null, 2));
+                    console.log("content len:", (j.choices?.[0]?.message?.content || "").length);
+                    console.log("finish_reason:", j.choices?.[0]?.finish_reason);
                     if (j.error) return resolve({ ok:false, msg:`API 요청 실패: ${JSON.stringify(j.error)}` });
                     const choice = j.choices?.[0];
                     const content = choice?.message?.content;
