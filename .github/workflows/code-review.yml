@@ -34,9 +34,32 @@ jobs:
             echo "no diff" > patch.diff
           fi
           echo "== DIFF SIZE ==" && wc -c patch.diff || true
-          echo "== DIFF HEAD ==" && head -n 60 patch.diff || true
+          echo "== DIFF HEAD ==" && head -n 40 patch.diff || true
 
-      - name: Generate review (debug with chunking)
+      - name: Minify diff (keep only changed lines and hunk headers)
+        run: |
+          set -euo pipefail
+          # 파일 경계, hunk header, 실제 +/- 변경 행만 남김
+          awk '
+            /^diff --git / {print; next}
+            /^@@/         {print; next}
+            /^\+/ && $0 !~ /^\+\+\+/ {print; next}
+            /^-/ && $0 !~ /^---/     {print; next}
+          ' patch.diff > patch.min.diff
+
+          # 안전 캡(2MB)
+          MAX_BYTES=$((1024*1024*2))
+          ACTUAL=$(wc -c < patch.min.diff || echo 0)
+          if [ "$ACTUAL" -gt "$MAX_BYTES" ]; then
+            head -c "$MAX_BYTES" patch.min.diff > patch.min.diff.trim
+            mv patch.min.diff.trim patch.min.diff
+            echo "[trim] patch.min.diff truncated to $MAX_BYTES bytes"
+          fi
+
+          echo "== MINIFIED DIFF SIZE ==" && wc -c patch.min.diff || true
+          echo "== MINIFIED DIFF HEAD ==" && head -n 40 patch.min.diff || true
+
+      - name: Generate review (debug with strong chunking)
         id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -45,7 +68,7 @@ jobs:
 
           if [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "review<<EOF" >> "$GITHUB_OUTPUT"
-            echo "OPENAI_API_KEY가 비어 있습니다. 포크 PR이거나 시크릿 미설정입니다. Settings > Secrets를 확인하세요." >> "$GITHUB_OUTPUT"
+            echo "OPENAI_API_KEY가 비어 있습니다. 포크 PR이거나 Secrets 미설정입니다." >> "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -54,8 +77,10 @@ jobs:
           const fs = require('fs');
           const https = require('https');
 
-          const CHUNK_CHAR_BUDGET = 10000;        // ~2.5k tokens 정도
-          const MAX_COMPLETION_TOKENS = 4000;     // 필요시 1500까지
+          // 🔧 강한 가드: 입력/출력 모두 짧게
+          const CHUNK_CHAR_BUDGET = 1200;     // ≈ 300 토큰 내외
+          const MAX_COMPLETION_TOKENS = 256;  // 먼저 짧게 강제
+          const MAX_CHUNKS = 60;              // 호출 개수 상한
 
           function readWhole(path) {
             try { return fs.readFileSync(path, 'utf8'); } catch { return ''; }
@@ -87,30 +112,34 @@ jobs:
 
           function buildPrompt(diffChunk) {
             return [
-              "아래는 이 PR의 unified diff(-U0) 일부입니다.",
-              "",
-              "리뷰 출력 형식:",
-              "1) 주요 이슈",
-              "2) 잠재적 버그/경계값",
-              "3) 보안/성능",
-              "4) 스타일/일관성",
-              "5) 테스트 보강 포인트",
-              "가능하면 코드 제안을 함께 제시하세요.",
+              "아래는 이 PR의 변경 라인 일부(diff -U0 최소화)입니다.",
+              "중요 이슈만 불릿으로 간결하게 작성하세요.",
+              "- 섹션: 1) 버그/경계 2) 보안/성능 3) 스타일 4) 테스트",
+              "- 각 섹션 최대 2개 불릿, 전체 최대 8문장/700자.",
+              "- 가능하면 코드 제안 1~2개.",
+              "출력은 불릿만, 서론/결론 금지. 마지막에 <END>로 종료.",
               "",
               "diff:",
-              diffChunk
+              diffChunk,
+              "",
+              "<END>"
             ].join("\n");
           }
 
           function callOpenAI(prompt) {
-            const payload = JSON.stringify({
+            const payloadObj = {
               model: "gpt-5",
               messages: [
-                { role: "system", content: "당신은 시니어 코드 리뷰어입니다. 변경된 라인 중심으로 근거와 구체적 수정안을 한국어로 제시하세요. 필요 시 코드 제안을 포함하세요." },
+                { role: "system", content: "시니어 코드 리뷰어. 간결·구체. 사족 금지. 결과만." },
                 { role: "user", content: prompt }
               ],
-              max_completion_tokens: MAX_COMPLETION_TOKENS
-            });
+              max_completion_tokens: MAX_COMPLETION_TOKENS,
+              reasoning: { effort: "low" },   // 내부 추론 토큰 억제 시도
+              stop: ["<END>"]
+            };
+            const payload = JSON.stringify(payloadObj);
+            console.log("=== OpenAI payload ===\n", payload); // 전송 파라미터 로깅
+
             const options = {
               hostname: "api.openai.com",
               port: 443,
@@ -121,6 +150,7 @@ jobs:
                 "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
               }
             };
+
             return new Promise((resolve) => {
               const req = https.request(options, (res) => {
                 let buf = "";
@@ -132,18 +162,14 @@ jobs:
 
                   try {
                     const j = JSON.parse(buf);
-                    console.log("=== OPENAI message ===");
-                    console.log(JSON.stringify(j.choices?.[0]?.message, null, 2));
-                    console.log("content len:", (j.choices?.[0]?.message?.content || "").length);
-                    console.log("finish_reason:", j.choices?.[0]?.finish_reason);
+                    console.log("=== OPENAI RAW RESPONSE ===\n", JSON.stringify(j, null, 2));
                     if (j.error) return resolve({ ok:false, msg:`API 요청 실패: ${JSON.stringify(j.error)}` });
                     const choice = j.choices?.[0];
-                    const content = choice?.message?.content;
-                    if (!content || !String(content).trim()) {
-                      return resolve({ ok:false, msg:`빈 choices. finish_reason=${choice?.finish_reason || 'n/a'}` });
-                    }
-                    resolve({ ok:true, msg:String(content).trim() });
+                    const content = (choice?.message?.content || "").trim();
+                    if (!content) return resolve({ ok:false, msg:`빈 choices. finish_reason=${choice?.finish_reason || 'n/a'}` });
+                    resolve({ ok:true, msg: content });
                   } catch (e) {
+                    console.log("응답 원문(앞부분):", buf.slice(0, 500));
                     resolve({ ok:false, msg:`응답 파싱 오류: ${e.message}` });
                   }
                 });
@@ -155,11 +181,10 @@ jobs:
           }
 
           async function reviewChunk(diffChunk) {
-            // 1차 시도
             let r = await callOpenAI(buildPrompt(diffChunk));
             if (r.ok) return r.msg;
 
-            // 길이로 추정되면 반으로 쪼개 재시도
+            // 길이 의심 시 더 잘게 나눠 재시도
             if (diffChunk.length > CHUNK_CHAR_BUDGET / 2) {
               const mid = Math.floor(diffChunk.length / 2);
               const left = diffChunk.slice(0, mid);
@@ -172,9 +197,9 @@ jobs:
           }
 
           (async () => {
-            const diff = readWhole("patch.diff");
+            const diff = readWhole("patch.min.diff");
             if (!diff.trim() || diff.trim() === "no diff") {
-              const msg = "patch.diff 가 비어 있습니다. 이 PR에 변경 라인이 없거나 diff 생성이 실패했습니다.";
+              const msg = "patch.min.diff 가 비어 있습니다. 변경 라인이 없거나 최소화 과정에서 비었습니다.";
               fs.writeFileSync("review.txt", msg, "utf8");
               console.log("REVIEW_RESULT<<EOF"); console.log(msg); console.log("EOF");
               process.exit(0);
@@ -182,15 +207,19 @@ jobs:
 
             const fileDiffs = splitByFile(diff);
             const outputs = [];
+            let processed = 0;
             for (const fd of fileDiffs) {
+              if (processed >= MAX_CHUNKS) { outputs.push(`(나머지 일부 파일은 스킵됨)`); break; }
               const fileChunks = chunkByChars(fd, CHUNK_CHAR_BUDGET);
               for (const ch of fileChunks) {
+                if (processed >= MAX_CHUNKS) break;
                 const out = await reviewChunk(ch);
                 if (out) outputs.push(out);
+                processed++;
               }
             }
 
-            const merged = outputs.join("\n\n---\n\n").slice(0, 24000); // 최종 안전 캡
+            const merged = outputs.join("\n\n---\n\n").slice(0, 20000); // 최종 안전 캡
             fs.writeFileSync("review.txt", merged || "리뷰 결과가 비어 있습니다.", "utf8");
             console.log("REVIEW_RESULT<<EOF"); 
             console.log(merged || "리뷰 결과가 비어 있습니다."); 
@@ -219,6 +248,7 @@ jobs:
           name: ai-review-debug
           path: |
             patch.diff
+            patch.min.diff
             review_out.txt
             review.txt
             openai_status.txt
