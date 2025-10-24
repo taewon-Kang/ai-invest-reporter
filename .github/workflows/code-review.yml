@@ -1,23 +1,20 @@
 name: Code Review
-
+on:
+  pull_request: { types: [opened, reopened, synchronize] }
 permissions:
   contents: read
   pull-requests: write
 
-on:
-  pull_request:
-    types: [opened, reopened, synchronize]
-
 jobs:
-  test:
+  review:
     runs-on: ubuntu-latest
     steps:
       - uses: anc95/ChatGPT-CodeReview@main
         env:
-          GITHUB_TOKEN: ${{ secrets.AI_REVIEW_PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.AI_REVIEW_PAT_TOKEN }} # 포크 PR이면 PAT 권장
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          # optional
           LANGUAGE: Korean
-          PROMPT:
-          MODEL: gpt-5 # https://platform.openai.com/docs/models
-          IGNORE_PATTERNS: /node_modules,*.md,/**/*.stories.tsx # Regex pattern to ignore files, separated by comma
+          MODEL: gpt-5
+          PROMPT: >
+            변경된 라인 중심으로 간결히. 버그/보안/성능/스타일/테스트를 불릿으로.
+          IGNORE_PATTERNS: /node_modules,*.md,/**/*.stories.tsx
