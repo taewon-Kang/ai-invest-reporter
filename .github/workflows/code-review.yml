@@ -55,7 +55,7 @@ jobs:
           const https = require('https');
 
           const CHUNK_CHAR_BUDGET = 10000;        // ~2.5k tokens 정도
-          const MAX_COMPLETION_TOKENS = 1200;     // 필요시 1500까지
+          const MAX_COMPLETION_TOKENS = 4000;     // 필요시 1500까지
 
           function readWhole(path) {
             try { return fs.readFileSync(path, 'utf8'); } catch { return ''; }
@@ -132,6 +132,7 @@ jobs:
 
                   try {
                     const j = JSON.parse(buf);
+                    console.log("j : ", j);
                     if (j.error) return resolve({ ok:false, msg:`API 요청 실패: ${JSON.stringify(j.error)}` });
                     const choice = j.choices?.[0];
                     const content = choice?.message?.content;
